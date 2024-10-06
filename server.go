@@ -25,137 +25,142 @@ var (
 	secret       = os.Getenv("WEBHOOK_SECRET")
 )
 
-func main() {
-	router := mux.NewRouter()
+func syncMaintenanceWindows() {
+	client := pagerduty.NewClient(pagerdutyKey)
 
-	router.HandleFunc("/webhook", handler).Methods("POST")
-	router.Use(mux.CORSMethodMiddleware(router))
-	http.Handle("/", router)
+	cachetClient, _ := cachet_go.NewClient(cachetURL, nil)
+	cachetClient.Authentication.SetTokenAuth(cachetKey)
+	_, status, err := cachetClient.General.Ping()
+	if err != nil || status.StatusCode != 200 {
+		log.Println(err)
+		return
+	}
 
-	go func() {
-		client := pagerduty.NewClient(pagerdutyKey)
-
-		cachetClient, _ := cachet_go.NewClient(cachetURL, nil)
-		cachetClient.Authentication.SetTokenAuth(cachetKey)
-		_, status, err := cachetClient.General.Ping()
-		if err != nil || status.StatusCode != 200 {
+	// Fethc maintenance windows every 30 minutes
+	for {
+		maintenanceWindows, err := fetchMaintenanceWindows(client)
+		if err != nil {
 			log.Println(err)
-			return
+			continue
+		}
+		log.Printf("Fetched %d maintenance windows\n", len(maintenanceWindows))
+
+		// Set them in cachet as schedules if they don't exist
+
+		// Get all schedules
+		schedules, _, err := cachetClient.Schedules.GetAll(&cachet_go.SchedulesQueryParams{
+			QueryOptions: cachet_go.QueryOptions{
+				PerPage: 100,
+			},
+		})
+		if err != nil {
+			log.Println(err)
+			continue
 		}
 
-		// Fethc maintenance windows every 30 minutes
-		for {
-			maintenanceWindows, err := fetchMaintenanceWindows(client)
+		// Create a map of schedules by start and end time
+		schedulesMap := map[string]*cachet_go.Schedule{}
+		for _, s := range schedules.Schedules {
+			schedulesMap[s.ScheduledAt+"_"+s.CompletedAt] = &s
+		}
+
+		// Load Europe/Berlin timezone
+		loc, err := time.LoadLocation("Europe/Berlin")
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		// Create a map of maintenance windows by start and end time if they don't exist
+		for _, mw := range maintenanceWindows {
+			// Convert the pagerduty time in the format "2015-11-09T20:00:00-05:00" to "Y-m-d H:i:sO".
+			// Keep in mind that cachet is in Europe/Berlin timezone
+			// Keep in mind that pagerduty is giving us a string
+
+			// Parse the start and end time
+			startTime, err := time.Parse(time.RFC3339, mw.StartTime)
 			if err != nil {
 				log.Println(err)
 				continue
 			}
-			log.Printf("Fetched %d maintenance windows\n", len(maintenanceWindows))
-
-			// Set them in cachet as schedules if they don't exist
-
-			// Get all schedules
-			schedules, _, err := cachetClient.Schedules.GetAll(&cachet_go.SchedulesQueryParams{
-				QueryOptions: cachet_go.QueryOptions{
-					PerPage: 100,
-				},
-			})
+			endTime, err := time.Parse(time.RFC3339, mw.EndTime)
 			if err != nil {
 				log.Println(err)
 				continue
 			}
 
-			// Create a map of schedules by start and end time
-			schedulesMap := map[string]*cachet_go.Schedule{}
-			for _, s := range schedules.Schedules {
-				schedulesMap[s.ScheduledAt+"_"+s.CompletedAt] = &s
-			}
-
-			// Load Europe/Berlin timezone
-			loc, err := time.LoadLocation("Europe/Berlin")
-			if err != nil {
-				log.Println(err)
+			// If the endTime is before now, skip
+			if endTime.Before(time.Now()) {
 				continue
 			}
 
-			// Create a map of maintenance windows by start and end time if they don't exist
-			for _, mw := range maintenanceWindows {
-				// Convert the pagerduty time in the format "2015-11-09T20:00:00-05:00" to "Y-m-d H:i:sO".
-				// Keep in mind that cachet is in Europe/Berlin timezone
-				// Keep in mind that pagerduty is giving us a string
+			// Convert the start and end time to Europe/Berlin timezone
+			startTime = startTime.In(loc)
+			endTime = endTime.In(loc)
 
-				// Parse the start and end time
-				startTime, err := time.Parse(time.RFC3339, mw.StartTime)
-				if err != nil {
-					log.Println(err)
-					continue
-				}
-				endTime, err := time.Parse(time.RFC3339, mw.EndTime)
-				if err != nil {
-					log.Println(err)
-					continue
-				}
+			// Convert the start and end time to the format "Y-m-d H:i:sO"
+			mw.StartTime = gotime.Format(startTime, "yyyy-mm-dd hhh:ii")
+			mw.EndTime = gotime.Format(endTime, "yyyy-mm-dd hhh:ii")
+			// Also convert it with space instead of + for the lookup table
+			mwStart := gotime.Format(startTime, "yyyy-mm-dd hhh:ii:ss")
+			mwEnd := gotime.Format(endTime, "yyyy-mm-dd hhh:ii:ss")
 
-				// If the endTime is before now, skip
-				if endTime.Before(time.Now()) {
-					continue
-				}
+			// If there is no summary then we want to set it to "Maintenance"
+			if mw.Description == "" {
+				mw.Description = "Maintenance"
+			}
 
-				// Convert the start and end time to Europe/Berlin timezone
-				startTime = startTime.In(loc)
-				endTime = endTime.In(loc)
+			log.Printf("Maintenance window (%s): %s - %s\n", mw.Summary, mw.StartTime, mw.EndTime)
 
-				// Convert the start and end time to the format "Y-m-d H:i:sO"
-				mw.StartTime = gotime.Format(startTime, "yyyy-mm-dd hhh:ii")
-				mw.EndTime = gotime.Format(endTime, "yyyy-mm-dd hhh:ii")
-				// Also convert it with space instead of + for the lookup table
-				mwStart := gotime.Format(startTime, "yyyy-mm-dd hhh:ii:ss")
-				mwEnd := gotime.Format(endTime, "yyyy-mm-dd hhh:ii:ss")
-
-				// If there is no summary then we want to set it to "Maintenance"
-				if mw.Description == "" {
-					mw.Description = "Maintenance"
-				}
-
-				log.Printf("Maintenance window (%s): %s - %s\n", mw.Summary, mw.StartTime, mw.EndTime)
-
-				var components []cachet_go.Component
-				if mw.Services != nil {
-					for _, s := range mw.Services {
-						component, err := findComponentByName(cachetClient, s.Summary)
-						if err != nil {
-							log.Println(err)
-							continue
-						}
-						if component != nil {
-							components = append(components, *component)
-						}
-					}
-				}
-
-				if _, ok := schedulesMap[mwStart+"_"+mwEnd]; !ok {
-					newSchedule := &cachet_go.Schedule{
-						Name:        mw.Description,
-						Message:     mw.Description,
-						Status:      "0",
-						ScheduledAt: mw.StartTime,
-						CompletedAt: mw.EndTime,
-						Components:  components,
-					}
-					// Print the schedule to the console
-					log.Printf("%+v\n", newSchedule)
-
-					_, _, err := cachetClient.Schedules.Create(newSchedule)
+			var components []cachet_go.Component
+			if mw.Services != nil {
+				for _, s := range mw.Services {
+					component, err := findComponentByName(cachetClient, s.Summary)
 					if err != nil {
 						log.Println(err)
 						continue
 					}
+					if component != nil {
+						components = append(components, *component)
+					}
 				}
 			}
 
-			time.Sleep(30 * time.Minute)
+			if _, ok := schedulesMap[mwStart+"_"+mwEnd]; !ok {
+				newSchedule := &cachet_go.Schedule{
+					Name:        mw.Description,
+					Message:     mw.Description,
+					Status:      "0",
+					ScheduledAt: mw.StartTime,
+					CompletedAt: mw.EndTime,
+					Components:  components,
+				}
+				// Print the schedule to the console
+				log.Printf("%+v\n", newSchedule)
+
+				_, _, err := cachetClient.Schedules.Create(newSchedule)
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+			}
 		}
-	}()
+
+		time.Sleep(30 * time.Minute)
+	}
+}
+
+func main() {
+	router := mux.NewRouter()
+
+	router.HandleFunc("/webhook", handler).Methods("POST")
+	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("GET")
+	router.Use(mux.CORSMethodMiddleware(router))
+	http.Handle("/", router)
+
+	go syncMaintenanceWindows()
 
 	log.Println("Listening on 0.0.0.0:8080")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", router))
