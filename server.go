@@ -435,6 +435,26 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+
+		// Update the component status to operational
+		_, cachetResp, err = client.Components.Update(cachetIncident.ComponentID, &cachet_go.Component{
+			ID:     cachetIncident.ComponentID,
+			Status: cachet_go.ComponentStatusOperational,
+		})
+		if err != nil {
+			log.Println(err)
+			// Print the cachetResp body as a string to the console
+			bytedata, err := io.ReadAll(cachetResp.Body)
+			r.Body.Close()
+			if err != nil {
+				log.Println("error reading cachetResp body")
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			log.Println(string(bytedata))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 	} else {
 		log.Println("unknown event type")
 
